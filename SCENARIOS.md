@@ -3,10 +3,46 @@
 Каждый сценарий ломает одну AWS-вещь. Всё остальное — инстансы, приложение, ОС — работает исправно.
 Цель: понять какой слой AWS-сети виноват и как это диагностировать через CLI.
 
-```
+```bash
 ./break.sh    # случайная поломка
 ./restore.sh  # восстановление
 ./status.sh   # стартовая точка диагностики
+```
+
+---
+
+## Откуда брать ID ресурсов
+
+Все ID создаются при `./create.sh` и сохраняются в файл `.state`.
+Перед диагностикой выполни две команды — credentials из `.env` и ID ресурсов из `.state`:
+
+```bash
+source .env && source .state
+```
+
+После этого можно копировать команды из этого файла без изменений — `$ALB_ARN`, `$VPC_ID` и т.д. подставятся автоматически.
+
+Посмотреть что внутри `.state`:
+
+```bash
+cat .state
+```
+
+Пример содержимого:
+
+```
+REGION=us-east-1
+VPC_ID=vpc-02dcabb1b395b43d3
+ALB_SG_ID=sg-0785b58c6fc1adf3a
+EC2_SG_ID=sg-0bfb32ea608248080
+ALB_ARN=arn:aws:elasticloadbalancing:...
+TG_ARN=arn:aws:elasticloadbalancing:...
+INSTANCE_1_ID=i-0ede99bebeb994308
+INSTANCE_2_ID=i-0bc09aa1b0182839d
+IGW_ID=igw-043d72c658cfed8b2
+RTB_ID=rtb-097486b9d2462eb9a
+KEY_NAME=troubleshoot-key
+...
 ```
 
 ---
@@ -67,56 +103,58 @@ Internet
 
 ### Концепция
 
-Security Group — это stateful межсетевой экран уровня ресурса.
-У ALB своя SG, отдельная от SG инстансов. Можно открыть EC2 и забыть открыть ALB — типичная ошибка.
+Security Group (SG) — виртуальный файрвол, привязанный к конкретному ресурсу.
+У ALB своя SG, у EC2 своя SG — это два разных файрвола. Можно открыть EC2 и забыть открыть ALB.
 
-Stateful означает: если входящий пакет разрешён, ответный выходит автоматически без отдельного outbound-правила.
+Stateful: если входящий пакет разрешён, ответный выходит автоматически без отдельного правила.
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
-| Браузер → ALB DNS | Зависает, потом timeout (соединение не устанавливается) |
-| `curl http://<ALB_DNS>` | `curl: (28) Connection timed out` |
+| Браузер → ALB DNS | Зависает, потом timeout — соединение не устанавливается |
+| `curl http://$ALB_DNS` | `curl: (28) Connection timed out` |
 | `./status.sh` → App Health Check | `FAIL` |
-| Target Group health | Может показать `healthy` (ALB → EC2 работает, сломан только вход) |
-| SSH на инстанс | Работает (другой SG, другой порт) |
+| Target Group health | Может показать `healthy` (ALB→EC2 работает, сломан только вход) |
+| SSH на инстанс | Работает — другой SG, другой порт |
 
 ### Диагностика
 
 ```bash
-# 1. Смотрим что вообще есть в ALB SG
+source .env && source .state
+
+# 1. Смотрим что в ALB SG — должно быть правило для порта 80
 aws ec2 describe-security-groups \
-    --group-ids <ALB_SG_ID> \
+    --group-ids $ALB_SG_ID \
     --query 'SecurityGroups[0].IpPermissions'
+# Норма:  [{ "FromPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}] }]
+# Сломано: [] — пустой массив
 
-# Нормальный результат — должно быть:
-# [{ "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}] }]
-# Сломанный результат — пустой массив: []
-
-# 2. Проверяем ALB сам по себе
+# 2. ALB сам по себе жив?
 aws elbv2 describe-load-balancers \
-    --load-balancer-arns <ALB_ARN> \
+    --load-balancer-arns $ALB_ARN \
     --query 'LoadBalancers[0].State'
-# Вернёт {"Code": "active"} — ALB жив, проблема не в нём
+# {"Code": "active"} — ALB жив, проблема не в нём
 
-# 3. Target group здоровье (ALB→EC2 работает)
+# 3. Таргеты здоровы? (ALB→EC2 работает внутри)
 aws elbv2 describe-target-health \
-    --target-group-arn <TG_ARN>
-# Таргеты могут быть healthy — это подтверждает что EC2 в порядке
+    --target-group-arn $TG_ARN \
+    --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State}'
+# Могут быть healthy — EC2 в порядке, проблема до ALB
 ```
 
-Логика: таймаут при подключении к ALB + здоровые таргеты = проблема до ALB = SG на ALB.
+Логика: timeout + ALB active + таргеты healthy = проблема до ALB = смотрим ALB SG.
 
 ### Решение
 
 ```bash
-# Вернуть правило
+source .env && source .state
+
 aws ec2 authorize-security-group-ingress \
-    --group-id <ALB_SG_ID> \
+    --group-id $ALB_SG_ID \
     --protocol tcp --port 80 --cidr "0.0.0.0/0"
 
-# Или одной командой:
+# Или:
 ./restore.sh
 ```
 
@@ -145,58 +183,69 @@ Internet
 │ EC2 Security Group                  │
 │ INBOUND: (ALB SG → 80 удалено) ✗   │  ← ЗДЕСЬ СЛОМАНО
 └─────────────────────────────────────┘
-    (ALB не может достучаться до EC2)
 
      Instance-1 / Instance-2  ← работают, просто заблокированы
 ```
 
 ### Концепция
 
-EC2 SG разрешает трафик не только по IP/CIDR, но и **по другой Security Group** (`source-group`).
-Это называется SG reference — вместо "разрешить с IP 10.0.x.x" говоришь "разрешить от всего что в ALB SG".
-Это гибче и безопаснее: не нужно знать IP ALB, который может меняться.
+EC2 SG может разрешать трафик не по IP, а по другой Security Group (SG reference).
+Правило "разрешить от ALB SG" означает: пускать трафик от любого ресурса, у которого есть ALB SG.
+Это удобно — не нужно знать IP ALB, который может меняться.
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
-| Браузер → ALB DNS | `502 Bad Gateway` — ALB достиг EC2, но EC2 не ответил |
-| `curl http://<ALB_DNS>` | HTTP 502 |
-| `./status.sh` → Target health | `unhealthy` — health checks от ALB тоже блокируются |
-| SSH на инстанс | Работает (порт 22 отдельным правилом, оно не тронуто) |
+| Браузер → ALB DNS | `502 Bad Gateway` |
+| `./status.sh` → Target health | `unhealthy` |
+| SSH на инстанс | Работает — порт 22 не тронут |
+| nginx на инстансе | Работает |
+
+502 vs 503: **502** = ALB нашёл таргет, но не получил ответ. **503** = таргетов нет вообще.
 
 ### Диагностика
 
 ```bash
-# 1. Видим 502 — значит ALB живой, проблема за ним
-# 2. Смотрим target health
-aws elbv2 describe-target-health --target-group-arn <TG_ARN>
+source .env && source .state
+
+# 1. Получаем IP инстансов для SSH
+aws ec2 describe-instances \
+    --instance-ids $INSTANCE_1_ID $INSTANCE_2_ID \
+    --query 'Reservations[*].Instances[*].{ID:InstanceId,IP:PublicIpAddress,State:State.Name}' \
+    --output table
+
+# 2. 502 → смотрим target health
+aws elbv2 describe-target-health \
+    --target-group-arn $TG_ARN \
+    --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason}'
 # State: unhealthy, Reason: Target.FailedHealthChecks
-# ALB пытается достучаться до EC2 на порту 80 — не может
 
-# 3. Смотрим EC2 SG
+# 3. Смотрим EC2 SG — есть ли правило для порта 80?
 aws ec2 describe-security-groups \
-    --group-ids <EC2_SG_ID> \
+    --group-ids $EC2_SG_ID \
     --query 'SecurityGroups[0].IpPermissions'
-# Нормально: UserIdGroupPairs с ALB SG ID
-# Сломано: только правило для порта 22, правила для порта 80 нет
+# Норма:  правило с "UserIdGroupPairs" содержащим ALB SG ID
+# Сломано: только правило для порта 22, порта 80 нет
 
-# 4. SSH на инстанс и проверяем что nginx живой
-ssh -i troubleshoot-key.pem -o IdentitiesOnly=yes ec2-user@<IP>
-sudo systemctl status nginx   # active (running) — nginx работает
-curl localhost/health          # ok — Flask тоже работает
+# 4. SSH → проверяем что приложение живое на инстансе
+ssh -i $KEY_NAME.pem -o IdentitiesOnly=yes ec2-user@<IP из шага 1>
+sudo systemctl status nginx        # active — nginx работает
+curl -s localhost/health           # ok — Flask работает
 # Вывод: проблема не в приложении, а в сети перед ним
 ```
 
-Логика: 502 от ALB + unhealthy таргеты + приложение на инстансе живое = EC2 SG блокирует ALB.
+Логика: 502 + unhealthy таргеты + приложение живое = EC2 SG не пускает ALB.
 
 ### Решение
 
 ```bash
+source .env && source .state
+
 aws ec2 authorize-security-group-ingress \
-    --group-id <EC2_SG_ID> \
+    --group-id $EC2_SG_ID \
     --protocol tcp --port 80 \
-    --source-group <ALB_SG_ID>
+    --source-group $ALB_SG_ID
 
 # Или:
 ./restore.sh
@@ -223,50 +272,54 @@ Internet → ALB SG → ALB
 
 ### Концепция
 
-Target Group — это список бэкендов куда ALB шлёт трафик.
-Каждый таргет проходит health checks. Если таргетов нет вообще — ALB возвращает 503.
-Регистрация/дерегистрация инстансов — отдельная операция от их запуска/остановки.
+Target Group — список бэкендов куда ALB шлёт трафик. Каждый таргет проходит health checks.
+Регистрация инстансов в TG — отдельная операция, не связанная с их запуском.
+Если таргетов нет — ALB возвращает 503.
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
 | Браузер → ALB DNS | `503 Service Unavailable` |
-| `curl http://<ALB_DNS>` | HTTP 503 |
-| `./status.sh` → Target health | Таблица пустая или `unused` |
+| `./status.sh` → Target health | Таблица пустая или статус `unused` |
 | SSH на инстанс | Работает |
 | nginx/Flask на инстансе | Работает |
-
-Ключевое отличие от сценария 2: **503 вместо 502**.
-- 502 = ALB нашёл таргет, но тот не ответил
-- 503 = ALB вообще не нашёл живых таргетов
 
 ### Диагностика
 
 ```bash
-# 1. 503 от ALB → смотрим target group
-aws elbv2 describe-target-health --target-group-arn <TG_ARN>
-# Результат: пустой массив [] или статус "unused"
+source .env && source .state
 
-# 2. Проверяем что инстансы живые
+# 1. 503 → смотрим target group — кто там зарегистрирован
+aws elbv2 describe-target-health \
+    --target-group-arn $TG_ARN \
+    --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State}'
+# [] — пустой массив. Инстансов нет.
+
+# 2. Инстансы сами по себе живые?
 aws ec2 describe-instances \
-    --instance-ids <ID1> <ID2> \
-    --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name}'
-# Оба running — инстансы в порядке
+    --instance-ids $INSTANCE_1_ID $INSTANCE_2_ID \
+    --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name}' \
+    --output table
+# Оба running — инстансы в порядке, просто не в TG
 
-# 3. Смотрим listener — куда ALB форвардит
-aws elbv2 describe-listeners --load-balancer-arn <ALB_ARN>
-# default action: forward to TG — всё правильно, проблема в TG
+# 3. Listener настроен правильно?
+aws elbv2 describe-listeners \
+    --load-balancer-arn $ALB_ARN \
+    --query 'Listeners[*].{Port:Port,Action:DefaultActions[0].Type}'
+# forward — правильно, проблема именно в TG
 ```
 
-Логика: 503 + пустой target group + живые инстансы = инстансы не зарегистрированы в TG.
+Логика: 503 + пустой TG + живые инстансы = инстансы не зарегистрированы в Target Group.
 
 ### Решение
 
 ```bash
+source .env && source .state
+
 aws elbv2 register-targets \
-    --target-group-arn <TG_ARN> \
-    --targets Id=<INSTANCE_1_ID> Id=<INSTANCE_2_ID>
+    --target-group-arn $TG_ARN \
+    --targets Id=$INSTANCE_1_ID Id=$INSTANCE_2_ID
 
 # Или:
 ./restore.sh
@@ -279,7 +332,7 @@ aws elbv2 register-targets \
 ### Что сломано
 
 Из Route Table удалена запись `0.0.0.0/0 → IGW`.
-Подсети знают только о внутренней сети VPC (`10.0.0.0/16`), но не знают как выйти в интернет.
+Подсеть знает только о внутренней сети VPC, но не знает как выйти в интернет.
 
 ```
 Internet
@@ -290,8 +343,8 @@ Internet
 
 ┌──────────────────────────────────┐
 │ Route Table                      │
-│ 10.0.0.0/16 → local  ✓          │
-│ 0.0.0.0/0   → igw-xxx  УДАЛЕНО ✗│  ← ЗДЕСЬ СЛОМАНО
+│ 10.0.0.0/16 → local      ✓      │
+│ 0.0.0.0/0   → igw   УДАЛЕНО ✗  │  ← ЗДЕСЬ СЛОМАНО
 └──────────────────────────────────┘
         │                │
    subnet-a          subnet-b
@@ -300,43 +353,49 @@ Internet
 
 ### Концепция
 
-Route Table — таблица маршрутизации подсети. Без маршрута `0.0.0.0/0 → IGW` подсеть **публичной не является** — она изолирована внутри VPC. Трафик снаружи не заходит, трафик изнутри не выходит.
+Route Table — таблица маршрутизации подсети. Без маршрута `0.0.0.0/0 → IGW` подсеть изолирована внутри VPC: трафик снаружи не заходит, изнутри не выходит.
 
-Отличие от сценария 5 (IGW detach): IGW существует и прицеплен к VPC, но подсеть о нём не знает.
+IGW (Internet Gateway) — точка входа/выхода между VPC и интернетом. Он на месте, но подсеть о нём не знает.
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
-| Браузер → ALB DNS | Timeout (соединение не устанавливается) |
+| Браузер → ALB DNS | Timeout — соединение не устанавливается |
 | SSH на инстанс | Timeout |
-| ALB State | Может стать `active` но недоступен |
-| Target health | `unhealthy` (ALB health checks тоже не доходят) |
+| `./status.sh` → Target health | `unhealthy` |
 
 ### Диагностика
 
 ```bash
-# 1. Полный timeout везде — значит проблема на сетевом уровне (не в приложении)
-# 2. Смотрим route table нашей подсети
-aws ec2 describe-route-tables --route-table-ids <RTB_ID>
-# Нормально: Routes содержит {"DestinationCidrBlock":"0.0.0.0/0","GatewayId":"igw-xxx"}
+source .env && source .state
+
+# 1. Полный timeout везде → проблема на сетевом уровне
+# 2. Смотрим маршруты в Route Table
+aws ec2 describe-route-tables \
+    --route-table-ids $RTB_ID \
+    --query 'RouteTables[0].Routes'
+# Норма:  содержит {"DestinationCidrBlock":"0.0.0.0/0","GatewayId":"igw-xxx","State":"active"}
 # Сломано: только {"DestinationCidrBlock":"10.0.0.0/16","GatewayId":"local"}
 
-# 3. Проверяем IGW — он на месте?
-aws ec2 describe-internet-gateways --internet-gateway-ids <IGW_ID>
-# IGW существует и Attachments показывает наш VPC — значит IGW не виноват
-# Проблема именно в маршруте
+# 3. IGW существует и прицеплен к VPC?
+aws ec2 describe-internet-gateways \
+    --internet-gateway-ids $IGW_ID \
+    --query 'InternetGateways[0].Attachments'
+# [{"State":"available","VpcId":"vpc-xxx"}] — IGW в порядке, виноват маршрут
 ```
 
-Логика: полный timeout (не 502, не 503) + IGW прицеплен + маршрута нет = Route Table.
+Логика: полный timeout + IGW прицеплен + маршрута нет = Route Table.
 
 ### Решение
 
 ```bash
+source .env && source .state
+
 aws ec2 create-route \
-    --route-table-id <RTB_ID> \
+    --route-table-id $RTB_ID \
     --destination-cidr-block "0.0.0.0/0" \
-    --gateway-id <IGW_ID>
+    --gateway-id $IGW_ID
 
 # Или:
 ./restore.sh
@@ -348,8 +407,7 @@ aws ec2 create-route \
 
 ### Что сломано
 
-Internet Gateway отцеплен от VPC (`detach-internet-gateway`).
-Маршрут в Route Table на IGW остался — но IGW больше не обслуживает этот VPC.
+Internet Gateway отцеплен от VPC. Маршрут в Route Table на IGW остался — но IGW больше не работает.
 
 ```
 Internet
@@ -358,7 +416,7 @@ Internet
 
 ┌──────────────────────────────────┐
 │ Route Table                      │
-│ 0.0.0.0/0 → igw-xxx  ✓ (есть)  │  ← маршрут есть, но IGW не работает
+│ 0.0.0.0/0 → igw ✓ (маршрут есть)│  ← маршрут есть, но IGW не работает
 └──────────────────────────────────┘
         │
    subnet-a / subnet-b
@@ -369,34 +427,38 @@ Internet
 
 IGW выполняет две функции:
 1. Маршрутизирует трафик между VPC и интернетом
-2. Делает NAT: заменяет приватный IP инстанса на публичный (и обратно)
+2. NAT: заменяет приватный IP инстанса на публичный (и обратно)
 
-Без прицепленного IGW маршрут `0.0.0.0/0 → igw-xxx` становится "битой ссылкой" — адресат есть, но не работает.
-
-Это коварный сценарий: Route Table выглядит корректно, IGW существует — но связи нет.
+Без прицепленного IGW маршрут `0.0.0.0/0 → igw-xxx` — "битая ссылка". Route Table выглядит правильно, IGW существует — но связи нет. Это делает сценарий коварным.
 
 ### Симптомы
 
-Идентичны сценарию 4: полный timeout и SSH, и HTTP.
+Идентичны сценарию 4 — полный timeout везде.
 
 | Что | Результат |
 |-----|-----------|
 | Браузер → ALB DNS | Timeout |
 | SSH на инстанс | Timeout |
-| Route Table | Выглядит правильно (маршрут есть!) |
+| Route Table | Выглядит правильно — маршрут есть! |
 
 ### Диагностика
 
 ```bash
-# 1. Полный timeout + Route Table выглядит нормально
-# 2. Проверяем IGW детально — смотрим Attachments
-aws ec2 describe-internet-gateways --internet-gateway-ids <IGW_ID>
-# Нормально: "Attachments": [{"State": "available", "VpcId": "vpc-xxx"}]
-# Сломано:   "Attachments": []  ← пустой массив, IGW ни к чему не прицеплен
+source .env && source .state
 
-# 3. Для сравнения — маршрут в Route Table есть:
-aws ec2 describe-route-tables --route-table-ids <RTB_ID>
-# 0.0.0.0/0 → igw-xxx  — маршрут на месте, но IGW не работает
+# 1. Полный timeout + Route Table выглядит нормально → копаем IGW
+# 2. Смотрим Route Table — маршрут есть?
+aws ec2 describe-route-tables \
+    --route-table-ids $RTB_ID \
+    --query 'RouteTables[0].Routes'
+# 0.0.0.0/0 → igw-xxx — маршрут на месте
+
+# 3. IGW прицеплен к VPC?
+aws ec2 describe-internet-gateways \
+    --internet-gateway-ids $IGW_ID \
+    --query 'InternetGateways[0].Attachments'
+# Норма:  [{"State":"available","VpcId":"vpc-xxx"}]
+# Сломано: [] — пустой массив, IGW ни к чему не прицеплен
 ```
 
 Отличие от сценария 4: Route Table правильный → копаем дальше → IGW без Attachments.
@@ -404,9 +466,11 @@ aws ec2 describe-route-tables --route-table-ids <RTB_ID>
 ### Решение
 
 ```bash
+source .env && source .state
+
 aws ec2 attach-internet-gateway \
-    --internet-gateway-id <IGW_ID> \
-    --vpc-id <VPC_ID>
+    --internet-gateway-id $IGW_ID \
+    --vpc-id $VPC_ID
 
 # Или:
 ./restore.sh
@@ -418,79 +482,92 @@ aws ec2 attach-internet-gateway \
 
 ### Что сломано
 
-В дефолтный Network ACL добавлено правило `rule 1: DENY TCP 80 inbound`.
-Security Groups при этом не тронуты — они разрешают трафик. Но NACL блокирует раньше.
+В Network ACL добавлено правило `rule 1: DENY TCP 80 inbound`.
+Security Groups не тронуты — они разрешают трафик. Но NACL блокирует на уровень выше.
 
 ```
 Internet → IGW → Route Table → Subnet
                                   │
                          ┌────────▼────────┐
                          │  Network ACL    │
-                         │  Rule 1: DENY   │  ← ЗДЕСЬ СЛОМАНО
+                         │  Rule  1: DENY  │  ← ЗДЕСЬ СЛОМАНО
                          │  TCP :80        │
                          │  Rule 100: ALLOW│
-                         │  all            │
-                         └─────────────────┘
-                                  │
-                              (отброшен)
-
+                         │  all traffic    │
+                         └────────┬────────┘
+                                  │ (отброшен, до SG не доходит)
+                                  ✗
                ┌──────────────────────────────┐
-               │ ALB Security Group: port 80 ✓ │  ← правила открыты,
-               └──────────────────────────────┘     но трафик до SG
-               ┌──────────────────────────────┐     не доходит
-               │ EC2 Security Group: port 80 ✓ │
+               │ ALB SG: port 80 открыт ✓     │  ← правила правильные,
+               └──────────────────────────────┘     но трафик не доходит
+               ┌──────────────────────────────┐
+               │ EC2 SG: port 80 открыт ✓     │
                └──────────────────────────────┘
 ```
 
 ### Концепция
 
-**Security Group vs Network ACL — ключевые различия:**
+**Security Group vs Network ACL:**
 
 | | Security Group | Network ACL |
 |--|---------------|-------------|
 | Уровень | Ресурс (EC2, ALB) | Подсеть |
-| Stateful | Да — ответ выходит автоматически | Нет — нужны правила для inbound И outbound |
+| Stateful | Да — ответ выходит автоматически | Нет — нужны правила для входящего И исходящего |
 | Правила | Только ALLOW | ALLOW и DENY |
-| Порядок | Все правила применяются | Numbered, первое совпадение выигрывает |
+| Порядок | Все правила суммируются | По номеру — первое совпадение выигрывает |
 | По умолчанию | Запрещено всё входящее | Разрешено всё |
 
-NACL обрабатывается **до** Security Group. Если NACL говорит DENY — до SG пакет не дойдёт.
+NACL обрабатывается **до** Security Group. DENY в NACL — трафик не дойдёт до SG.
 
-Это самый коварный сценарий: SG выглядит правильно, всё открыто — а трафик не идёт.
+Это самый коварный сценарий: SG выглядит правильно — а трафик не идёт.
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
 | Браузер → ALB DNS | Timeout |
-| SSH на инстанс | Работает (порт 22 не заблокирован в NACL) |
-| Security Groups | Выглядят правильно — порт 80 открыт |
-| Target health | Unhealthy (health checks от ALB тоже блокируются) |
+| SSH на инстанс | **Работает** — порт 22 в NACL не заблокирован |
+| ALB SG и EC2 SG | Выглядят правильно — порт 80 открыт |
+
+SSH работает, а HTTP нет, при этом SG открыты → думаем о NACL.
 
 ### Диагностика
 
 ```bash
-# 1. Timeout на HTTP, но SSH работает — SG открыты
-# 2. Смотрим SG — всё правильно. Копаем выше по стеку
-# 3. Смотрим Network ACL нашего VPC
+source .env && source .state
+
+# 1. HTTP timeout, SSH работает, SG открыты → смотрим NACL
 aws ec2 describe-network-acls \
-    --filters "Name=vpc-id,Values=<VPC_ID>" "Name=default,Values=true" \
-    --query 'NetworkAcls[0].Entries'
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=default,Values=true" \
+    --query 'NetworkAcls[0].Entries[?Egress==`false`]' \
+    --output table
+# Норма:  одно правило RuleNumber=100, RuleAction=allow
+# Сломано: RuleNumber=1, RuleAction=deny, Protocol=6(TCP), Port=80
+#          это правило выполняется РАНЬШЕ чем allow — трафик дропается
 
-# Нормально: одно правило rule=100 ALLOW all + rule=32767 DENY all (implicit)
-# Сломано: rule=1 DENY TCP 80 ПЕРЕД rule=100 ALLOW all
-
-# Правила применяются по номеру — rule 1 срабатывает раньше rule 100
+# 2. Для сравнения — смотрим SG, они в порядке
+aws ec2 describe-security-groups \
+    --group-ids $ALB_SG_ID \
+    --query 'SecurityGroups[0].IpPermissions'
+# Порт 80 открыт — SG не виноват
 ```
 
-Логика: HTTP timeout + SSH работает + SG открыты = NACL или что-то выше (IGW/RTB).
-Проверяем NACL — видим DENY с низким номером правила.
+Логика: HTTP timeout + SSH работает + SG правильный = NACL.
 
 ### Решение
 
 ```bash
+source .env && source .state
+
+# Узнаём NACL ID
+NACL_ID=$(aws ec2 describe-network-acls \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=default,Values=true" \
+    --query 'NetworkAcls[0].NetworkAclId' \
+    --output text)
+
+# Удаляем правило #1
 aws ec2 delete-network-acl-entry \
-    --network-acl-id <NACL_ID> \
+    --network-acl-id $NACL_ID \
     --ingress \
     --rule-number 1
 
@@ -504,8 +581,8 @@ aws ec2 delete-network-acl-entry \
 
 ### Что сломано
 
-Instance-1 остановлен (`stop-instances`). Имитирует Spot interruption — AWS забирает ёмкость.
-Instance-2 работает нормально. ALB должен перестать слать трафик на Instance-1.
+Instance-1 остановлен. Имитирует Spot interruption — AWS забирает ёмкость обратно.
+Instance-2 работает. ALB перестаёт слать трафик на Instance-1.
 
 ```
 Internet → ALB SG → ALB
@@ -516,58 +593,68 @@ Internet → ALB SG → ALB
               │ Instance-2  ✓│  ← running, healthy
               └─────────────┘
                      │
-              Instance-2 обслуживает всё
+              Instance-2 обслуживает весь трафик
 ```
 
 ### Концепция
 
-**Spot Instance** — AWS продаёт свободную ёмкость со скидкой до 90%. Когда эта ёмкость нужна AWS — он даёт 2 минуты на завершение работы и останавливает (или терминирует) инстанс.
+Spot Instance — AWS продаёт свободные мощности со скидкой до 90%.
+Когда мощности нужны AWS — он даёт 2 минуты и останавливает инстанс.
 
-В нашем сетапе:
-- `SpotInstanceType: persistent` — запрос остаётся открытым, AWS перезапустит когда будет ёмкость
-- `InstanceInterruptionBehavior: stop` — инстанс останавливается, данные на EBS сохраняются
+В нашем сетапе `persistent` + `stop`: инстанс остановится, данные на EBS сохранятся, AWS перезапустит когда появится ёмкость.
 
-ALB автоматически перестаёт слать трафик на нездоровый таргет — это и есть смысл multi-AZ.
+ALB автоматически убирает упавший инстанс из ротации — в этом смысл двух AZ.
+
+Статус spot request показывает причину остановки:
+- `instance-stopped-by-user` — остановил пользователь, AWS не перезапустит
+- `marked-for-stop` — AWS прерывает прямо сейчас (есть 2 минуты)
 
 ### Симптомы
 
 | Что | Результат |
 |-----|-----------|
 | Браузер → ALB DNS | Работает (через Instance-2) |
-| App Health Check | OK |
-| Target health Instance-1 | `unused` или `unhealthy` |
-| Target health Instance-2 | `healthy` |
-| SSH на Instance-1 | Timeout (инстанс остановлен) |
+| `./status.sh` → Target health Instance-1 | `unhealthy` или `unused` |
+| `./status.sh` → Target health Instance-2 | `healthy` |
+| SSH на Instance-1 | Timeout |
 | SSH на Instance-2 | Работает |
 
 ### Диагностика
 
 ```bash
-# 1. Приложение работает, но что-то не так
-# 2. Смотрим target health
-aws elbv2 describe-target-health --target-group-arn <TG_ARN>
+source .env && source .state
+
+# 1. Приложение работает, но один таргет упал → смотрим target health
+aws elbv2 describe-target-health \
+    --target-group-arn $TG_ARN \
+    --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State}'
 # Instance-1: unhealthy / unused
 # Instance-2: healthy
 
-# 3. Смотрим состояние инстансов
+# 2. Состояние инстансов
 aws ec2 describe-instances \
-    --instance-ids <INSTANCE_1_ID> <INSTANCE_2_ID> \
-    --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name,Type:InstanceLifecycle}'
+    --instance-ids $INSTANCE_1_ID $INSTANCE_2_ID \
+    --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name,Lifecycle:InstanceLifecycle}' \
+    --output table
 # Instance-1: stopped, spot
 # Instance-2: running, spot
 
-# 4. Проверяем spot request
+# 3. Почему остановлен — смотрим spot request
 aws ec2 describe-spot-instance-requests \
-    --filters "Name=instance-id,Values=<INSTANCE_1_ID>"
-# Status: instance-stopped
+    --filters "Name=instance-id,Values=$INSTANCE_1_ID" \
+    --query 'SpotInstanceRequests[0].{State:State,Status:Status.Code}'
+# instance-stopped-by-user → остановил пользователь (или имитация interruption)
+# marked-for-stop           → AWS прерывает сейчас
 ```
 
-Логика: один таргет unhealthy + инстанс stopped + spot lifecycle = Spot interruption.
+Логика: один таргет unhealthy + инстанс stopped + lifecycle=spot = Spot interruption.
 
 ### Решение
 
 ```bash
-aws ec2 start-instances --instance-ids <INSTANCE_1_ID>
+source .env && source .state
+
+aws ec2 start-instances --instance-ids $INSTANCE_1_ID
 
 # Или:
 ./restore.sh
@@ -575,50 +662,48 @@ aws ec2 start-instances --instance-ids <INSTANCE_1_ID>
 
 ---
 
-## Шпаргалка: что даёт какой симптом
+## Шпаргалка: симптом → сценарий
 
 ```
 Браузер timeout (соединение не устанавливается)
-├── SSH тоже не работает → проблема на уровне сети до инстансов
-│   ├── Route Table: нет маршрута 0.0.0.0/0        (сц. 4)
-│   └── IGW: отцеплен от VPC                        (сц. 5)
+├── SSH тоже не работает → проблема глубже в сети
+│   ├── describe-route-tables  → нет маршрута 0.0.0.0/0?  → сц. 4
+│   └── describe-internet-gateways → Attachments пустой?  → сц. 5
 │
-└── SSH работает → трафик до инстансов доходит, но порт 80 блокируется
-    ├── SG на ALB закрыт (нет inbound 80)           (сц. 1)
-    └── NACL: DENY rule для порта 80                 (сц. 6)
-        (проверяй NACL когда SG выглядит правильно)
+└── SSH работает, SG открыты → NACL
+    └── describe-network-acls → есть DENY rule?           → сц. 6
 
-Браузер получает HTTP-ответ с ошибкой
+└── SSH работает, SG пустой (нет inbound 80 на ALB SG)   → сц. 1
+
+Браузер получает HTTP-ошибку
 ├── HTTP 502 Bad Gateway
-│   └── ALB не может достучаться до EC2             (сц. 2)
-│       (EC2 SG не пускает ALB)
+│   └── EC2 SG не пускает ALB                            → сц. 2
 │
 └── HTTP 503 Service Unavailable
-    └── Target Group пустой или все таргеты unhealthy (сц. 3)
+    └── Target Group пустой или все unhealthy             → сц. 3
 
 Приложение работает, но один инстанс выпал
-└── Spot interruption / инстанс остановлен           (сц. 7)
+└── describe-target-health → один unhealthy              → сц. 7
 ```
 
-## Порядок диагностики (общий алгоритм)
+## Общий алгоритм диагностики
 
-```
-1. ./status.sh                          # общая картина
-2. curl -v http://<ALB_DNS>/health      # какой HTTP-код?
-3. ssh ... ec2-user@<IP>                # доступен ли инстанс?
+```bash
+source .env && source .state
 
-Если timeout:
-  4a. describe-route-tables             # есть маршрут 0.0.0.0/0?
-  4b. describe-internet-gateways        # IGW прицеплен к VPC?
-  4c. describe-network-acls             # нет ли DENY в NACL?
-  4d. describe-security-groups (ALB SG) # открыт порт 80?
+# Шаг 1 — общая картина
+./status.sh
 
-Если 502:
-  4. describe-target-health             # unhealthy?
-  5. ssh → curl localhost/health        # приложение живое?
-  6. describe-security-groups (EC2 SG)  # есть правило от ALB SG?
+# Шаг 2 — какой HTTP-код возвращает ALB?
+ALB_DNS=$(aws elbv2 describe-load-balancers \
+    --load-balancer-arns $ALB_ARN \
+    --query 'LoadBalancers[0].DNSName' --output text)
+curl -sv http://$ALB_DNS/health 2>&1 | grep "< HTTP"
 
-Если 503:
-  4. describe-target-health             # пустой TG?
-  5. describe-instances                 # инстансы running?
+# Шаг 3 — доступен ли инстанс по SSH?
+IP_1=$(aws ec2 describe-instances --instance-ids $INSTANCE_1_ID \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+ssh -i $KEY_NAME.pem -o IdentitiesOnly=yes ec2-user@$IP_1
+
+# Дальше — по дереву симптомов выше
 ```

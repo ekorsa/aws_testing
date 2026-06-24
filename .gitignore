@@ -1,4 +1,5 @@
 .state
+.state_*
 .break_state
 *.pem
 .env
