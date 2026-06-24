@@ -1,0 +1,6 @@
+.state
+.break_state
+*.pem
+.env
+.git/
+.claude/settings.local.json
